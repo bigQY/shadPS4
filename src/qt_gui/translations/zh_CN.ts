@@ -899,4 +899,19 @@
             <translation>名称:</translation>
         </message>
     </context>	
+    <context>
+        <name>QPlatformTheme</name>
+        <message>
+            <location filename="../src/widgets/qdialogbuttonbox.cpp" line="+42"/>
+            <location line="+18"/>
+            <source>OK</source>
+            <translation>确定</translation>
+        </message>
+        <message>
+            <location line="+54"/>
+            <source>Cancel</source>
+            <translation>取消</translation>
+        </message>
+        <
+    </context>
 </TS>
