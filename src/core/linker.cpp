@@ -146,8 +146,19 @@ s32 Linker::LoadModule(const std::filesystem::path& elf_name, bool is_dynamic) {
     }
 
     num_static_modules += !is_dynamic;
+    const u32 module_index = m_modules.size();
+    
+    // 记录模块的地址范围用于快速查找
+    VAddr start_addr = module->GetBaseAddress();
+    VAddr end_addr = start_addr + module->aligned_base_size;
+    m_address_ranges.push_back({start_addr, end_addr});
+    
     m_modules.emplace_back(std::move(module));
-    return m_modules.size() - 1;
+    
+    // 将模块名称和索引添加到哈希表中，加速后续查找
+    m_module_name_map[elf_name.string()] = module_index;
+    
+    return module_index;
 }
 
 s32 Linker::LoadAndStartModule(const std::filesystem::path& path, u64 args, const void* argp,
@@ -180,10 +191,11 @@ s32 Linker::LoadAndStartModule(const std::filesystem::path& path, u64 args, cons
 }
 
 Module* Linker::FindByAddress(VAddr address) {
-    for (auto& module : m_modules) {
-        const VAddr base = module->GetBaseAddress();
-        if (address >= base && address < base + module->aligned_base_size) {
-            return module.get();
+    // 使用我们构建的地址范围索引进行快速查找
+    for (size_t i = 0; i < m_address_ranges.size(); i++) {
+        const auto& range = m_address_ranges[i];
+        if (address >= range.first && address < range.second) {
+            return m_modules[i].get();
         }
     }
     return nullptr;
@@ -294,10 +306,19 @@ const Module* Linker::FindExportedModule(const ModuleInfo& module, const Library
 
 bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Module* m,
                      Loader::SymbolRecord* return_info) {
+    // 首先检查符号缓存
+    auto cache_it = m_symbol_cache.find(name);
+    if (cache_it != m_symbol_cache.end()) {
+        *return_info = cache_it->second;
+        return return_info->virtual_address != 0;
+    }
+
     const auto ids = Common::SplitString(name, '#');
     if (ids.size() != 3) {
         return_info->virtual_address = 0;
         return_info->name = name;
+        // 缓存失败结果
+        m_symbol_cache[name] = *return_info;
         LOG_ERROR(Core_Linker, "Not Resolved {}", name);
         return false;
     }
@@ -325,6 +346,8 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
     }
     if (record) {
         *return_info = *record;
+        // 缓存成功结果
+        m_symbol_cache[name] = *return_info;
         return true;
     }
 
@@ -338,6 +361,9 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
     }
     LOG_ERROR(Core_Linker, "Linker: Stub resolved {} as {} (lib: {}, mod: {})", sr.name,
               return_info->name, library->name, module->name);
+    
+    // 缓存结果，无论是成功还是失败的
+    m_symbol_cache[name] = *return_info;
     return false;
 }
 

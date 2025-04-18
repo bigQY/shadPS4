@@ -81,6 +81,9 @@ static void ResetSubmissionLock(Platform::InterruptId irq) {
 
 static void WaitGpuIdle() {
     HLE_TRACE;
+    if (submission_lock == 0) {
+        return; // 快速路径：如果无锁直接返回
+    }
     std::unique_lock lock{m_submission};
     cv_lock.wait(lock, [] { return submission_lock == 0; });
 }
@@ -89,7 +92,7 @@ static void WaitGpuIdle() {
 static inline u32* WriteTrailingNop(u32* cmdbuf, u32 data_block_size) {
     auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf);
     nop->header = PM4Type3Header{PM4ItOpcode::Nop, data_block_size - 1};
-    nop->data_block[0] = 0u; // only one out of `data_block_size` is initialized
+    nop->data_block[0] = 0u; // 只初始化第一个元素，其余部分不需要清零
     return cmdbuf + data_block_size + 1 /* header */;
 }
 
@@ -98,7 +101,7 @@ template <u32 data_block_size>
 static inline u32* WriteTrailingNop(u32* cmdbuf) {
     auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf);
     nop->header = PM4Type3Header{PM4ItOpcode::Nop, data_block_size - 1};
-    nop->data_block[0] = 0u; // only one out of `data_block_size` is initialized
+    nop->data_block[0] = 0u; // 只初始化第一个元素，其余部分不需要清零
     return cmdbuf + data_block_size + 1 /* header */;
 }
 
@@ -2022,10 +2025,15 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
     cmdbuf += size - 64;
     ASSERT_MSG(cmdbuf[0] == 0xc03e1000, "Can't find `prepareFlip` packet");
 
-    std::array<u32, 7> backup{};
-    std::memcpy(backup.data(), cmdbuf, backup.size() * sizeof(decltype(backup)::value_type));
+    // 只保留需要的数据，减少栈内存使用
+    u32 backup_1 = cmdbuf[1];
+    u32 backup_2 = cmdbuf[2];
+    u32 backup_3 = cmdbuf[3];
+    u32 backup_4 = cmdbuf[4];
+    u32 backup_5 = cmdbuf[5];
+    u32 backup_6 = cmdbuf[6];
 
-    ASSERT_MSG(((backup[2] & 3) == 0u) || (backup[1] != PM4CmdNop::PayloadType::PrepareFlipLabel),
+    ASSERT_MSG(((backup_2 & 3) == 0u) || (backup_1 != PM4CmdNop::PayloadType::PrepareFlipLabel),
                "Invalid flip packet");
     ASSERT_MSG(buf_idx != 0xffff'ffffu, "Invalid VO buffer index");
 
@@ -2055,11 +2063,11 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
 
     auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf + 5);
 
-    if (backup[1] == PM4CmdNop::PayloadType::PrepareFlip) {
+    if (backup_1 == PM4CmdNop::PayloadType::PrepareFlip) {
         nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x39};
         nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
     } else {
-        if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipLabel) {
+        if (backup_1 == PM4CmdNop::PayloadType::PrepareFlipLabel) {
             nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x34};
             nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
 
@@ -2067,29 +2075,29 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
             auto* write_label = reinterpret_cast<PM4CmdWriteData*>(cmdbuf + 0x3b);
             write_label->header = PM4Type3Header{PM4ItOpcode::WriteData, 3};
             write_label->raw = 0x500u;
-            write_label->dst_addr_lo = backup[2] & 0xffff'fffcu;
-            write_label->dst_addr_hi = backup[3];
-            write_label->data[0] = backup[4];
+            write_label->dst_addr_lo = backup_2 & 0xffff'fffcu;
+            write_label->dst_addr_hi = backup_3;
+            write_label->data[0] = backup_4;
         }
-        if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipInterruptLabel) {
+        if (backup_1 == PM4CmdNop::PayloadType::PrepareFlipInterruptLabel) {
             nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x33};
             nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
 
             auto* write_eop = reinterpret_cast<PM4CmdEventWriteEop*>(cmdbuf + 0x3a);
             write_eop->header = PM4Type3Header{PM4ItOpcode::EventWriteEop, 4};
-            write_eop->event_control = (backup[5] & 0x3f) + 0x500u + (backup[6] & 0x3f) * 0x1000;
-            write_eop->address_lo = backup[2] & 0xffff'fffcu;
-            write_eop->data_control = (backup[3] & 0xffffu) | 0x2200'0000u;
-            write_eop->data_lo = backup[4];
+            write_eop->event_control = (backup_5 & 0x3f) + 0x500u + (backup_6 & 0x3f) * 0x1000;
+            write_eop->address_lo = backup_2 & 0xffff'fffcu;
+            write_eop->data_control = (backup_3 & 0xffffu) | 0x2200'0000u;
+            write_eop->data_lo = backup_4;
             write_eop->data_hi = 0u;
         }
-        if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipInterrupt) {
+        if (backup_1 == PM4CmdNop::PayloadType::PrepareFlipInterrupt) {
             nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x33};
             nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
 
             auto* write_eop = reinterpret_cast<PM4CmdEventWriteEop*>(cmdbuf + 0x3a);
             write_eop->header = PM4Type3Header{PM4ItOpcode::EventWriteEop, 4};
-            write_eop->event_control = (backup[5] & 0x3f) + 0x500u + (backup[6] & 0x3f) * 0x1000;
+            write_eop->event_control = (backup_5 & 0x3f) + 0x500u + (backup_6 & 0x3f) * 0x1000;
             write_eop->address_lo = 0u;
             write_eop->data_control = 0x100'0000u;
             write_eop->data_lo = 0u;
@@ -2141,6 +2149,8 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
         return 0x80d11000;
     }
 
+    // 提前预分配限制检查结果，避免多次循环
+    bool has_invalid_sizes = false;
     for (u32 i = 0; i < count; i++) {
         if (dcb_sizes_in_bytes[i] == 0) {
             LOG_ERROR(Lib_GnmDriver, "Submitting a null DCB {}", i);
@@ -2149,13 +2159,17 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
         if (dcb_sizes_in_bytes[i] > 0x3ffffc) {
             LOG_ERROR(Lib_GnmDriver, "dcbSizesInBytes[{}] ({}) is limited to (2*20)-1 DWORDS", i,
                       dcb_sizes_in_bytes[i]);
-            return 0x80d11000;
+            has_invalid_sizes = true;
         }
         if (ccb_sizes_in_bytes && ccb_sizes_in_bytes[i] > 0x3ffffc) {
             LOG_ERROR(Lib_GnmDriver, "ccbSizesInBytes[{}] ({}) is limited to (2*20)-1 DWORDS", i,
                       ccb_sizes_in_bytes[i]);
-            return 0x80d11000;
+            has_invalid_sizes = true;
         }
+    }
+    
+    if (has_invalid_sizes) {
+        return 0x80d11000;
     }
 
     WaitGpuIdle();
@@ -2164,6 +2178,7 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
         DebugState.PauseGuestThreads();
     }
 
+    // 初始化硬件状态（如果需要）
     if (send_init_packet) {
         if (sdk_version <= 0x1ffffffu) {
             liverpool->SubmitGfx(InitSequence, {});
@@ -2191,6 +2206,20 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
         send_init_packet = false;
     }
 
+    // 局部变量避免重复计算
+    const bool is_dumping_frame = DebugState.DumpingCurrentFrame();
+    static auto last_frame_num = -1LL;
+    static u32 seq_num{};
+    if (is_dumping_frame) {
+        if (last_frame_num == frames_submitted) {
+            ++seq_num;
+        } else {
+            last_frame_num = frames_submitted;
+            seq_num = 0u;
+        }
+    }
+
+    // 批量处理命令缓冲区
     for (auto cbpair = 0u; cbpair < count; ++cbpair) {
         const auto* ccb = ccb_gpu_addrs ? ccb_gpu_addrs[cbpair] : nullptr;
         const auto ccb_size_in_bytes = ccb_sizes_in_bytes ? ccb_sizes_in_bytes[cbpair] : 0;
@@ -2201,16 +2230,7 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
         const auto& dcb_span = std::span{dcb_gpu_addrs[cbpair], dcb_size_dw};
         const auto& ccb_span = std::span{ccb, ccb_size_dw};
 
-        if (DebugState.DumpingCurrentFrame()) {
-            static auto last_frame_num = -1LL;
-            static u32 seq_num{};
-            if (last_frame_num == frames_submitted && cbpair == 0) {
-                ++seq_num;
-            } else {
-                last_frame_num = frames_submitted;
-                seq_num = 0u;
-            }
-
+        if (is_dumping_frame) {
             using DebugStateType::QueueType;
 
             DebugState.PushQueueDump({

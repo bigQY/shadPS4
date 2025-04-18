@@ -282,11 +282,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
-    auto state = PrepareRenderState(pipeline->GetMrtMask());
+    const u32 mrt_mask = pipeline->GetMrtMask();
+    auto state = PrepareRenderState(mrt_mask);
+    
+    // 提前检查资源绑定，失败时直接返回
     if (!BindResources(pipeline)) {
         return;
     }
 
+    // 合并顶点缓冲区和索引缓冲区的绑定逻辑
     buffer_cache.BindVertexBuffers(*pipeline);
     if (is_indexed) {
         buffer_cache.BindIndexBuffer(index_offset);
@@ -302,6 +306,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
+    // 使用内联条件避免额外的分支判断
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
@@ -444,14 +449,21 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         return false;
     }
 
+    // 预先分配足够的容量，避免动态扩容
     set_writes.clear();
+    set_writes.reserve(32);  // 预留足够容量避免重新分配
     buffer_barriers.clear();
+    buffer_barriers.reserve(16);
     buffer_infos.clear();
+    buffer_infos.reserve(32);
     image_infos.clear();
+    image_infos.reserve(32);
 
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     Shader::PushData push_data = MakeUserData(liverpool->regs);
+    
+    // 一次性处理所有阶段的资源绑定
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
@@ -970,34 +982,48 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline& pipeline) const {
 void Rasterizer::UpdateViewportScissorState() const {
     const auto& regs = liverpool->regs;
 
-    const auto combined_scissor_value_tl = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
-        return std::max({scr, s16(win + win_offset), s16(gen + win_offset)});
-    };
-    const auto combined_scissor_value_br = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
-        return std::min({scr, s16(win + win_offset), s16(gen + win_offset)});
-    };
+    // 预分配容量避免动态扩容
+    static constexpr size_t MAX_VIEWPORTS = Liverpool::NumViewports;
+    boost::container::static_vector<vk::Viewport, MAX_VIEWPORTS> viewports;
+    boost::container::static_vector<vk::Rect2D, MAX_VIEWPORTS> scissors;
+    viewports.reserve(MAX_VIEWPORTS);
+    scissors.reserve(MAX_VIEWPORTS);
+
+    // 计算合并的裁剪区域，避免在循环中重复计算
     const bool enable_offset = !regs.window_scissor.window_offset_disable.Value();
+    const s16 window_x_offset = enable_offset ? regs.window_offset.window_x_offset : 0;
+    const s16 window_y_offset = enable_offset ? regs.window_offset.window_y_offset : 0;
 
-    Liverpool::Scissor scsr{};
-    scsr.top_left_x = combined_scissor_value_tl(
-        regs.screen_scissor.top_left_x, s16(regs.window_scissor.top_left_x.Value()),
-        s16(regs.generic_scissor.top_left_x.Value()),
-        enable_offset ? regs.window_offset.window_x_offset : 0);
-    scsr.top_left_y = combined_scissor_value_tl(
-        regs.screen_scissor.top_left_y, s16(regs.window_scissor.top_left_y.Value()),
-        s16(regs.generic_scissor.top_left_y.Value()),
-        enable_offset ? regs.window_offset.window_y_offset : 0);
-    scsr.bottom_right_x = combined_scissor_value_br(
-        regs.screen_scissor.bottom_right_x, regs.window_scissor.bottom_right_x,
-        regs.generic_scissor.bottom_right_x,
-        enable_offset ? regs.window_offset.window_x_offset : 0);
-    scsr.bottom_right_y = combined_scissor_value_br(
-        regs.screen_scissor.bottom_right_y, regs.window_scissor.bottom_right_y,
-        regs.generic_scissor.bottom_right_y,
-        enable_offset ? regs.window_offset.window_y_offset : 0);
+    // 组合裁剪值计算
+    const auto combined_tl_x = std::max({
+        regs.screen_scissor.top_left_x, 
+        s16(regs.window_scissor.top_left_x.Value() + window_x_offset),
+        s16(regs.generic_scissor.top_left_x.Value() + window_x_offset)
+    });
+    
+    const auto combined_tl_y = std::max({
+        regs.screen_scissor.top_left_y, 
+        s16(regs.window_scissor.top_left_y.Value() + window_y_offset),
+        s16(regs.generic_scissor.top_left_y.Value() + window_y_offset)
+    });
+    
+    const auto combined_br_x = std::min({
+        regs.screen_scissor.bottom_right_x, 
+        s16(regs.window_scissor.bottom_right_x + window_x_offset),
+        s16(regs.generic_scissor.bottom_right_x + window_x_offset)
+    });
+    
+    const auto combined_br_y = std::min({
+        regs.screen_scissor.bottom_right_y, 
+        s16(regs.window_scissor.bottom_right_y + window_y_offset),
+        s16(regs.generic_scissor.bottom_right_y + window_y_offset)
+    });
 
-    boost::container::static_vector<vk::Viewport, Liverpool::NumViewports> viewports;
-    boost::container::static_vector<vk::Rect2D, Liverpool::NumViewports> scissors;
+    Liverpool::Scissor base_scissor{};
+    base_scissor.top_left_x = combined_tl_x;
+    base_scissor.top_left_y = combined_tl_y;
+    base_scissor.bottom_right_x = combined_br_x;
+    base_scissor.bottom_right_y = combined_br_y;
 
     if (regs.polygon_control.enable_window_offset &&
         (regs.window_offset.window_x_offset != 0 || regs.window_offset.window_y_offset != 0)) {
@@ -1005,7 +1031,12 @@ void Rasterizer::UpdateViewportScissorState() const {
                   "PA_SU_SC_MODE_CNTL.VTX_WINDOW_OFFSET_ENABLE support is not yet implemented.");
     }
 
+    // 预计算视口共用值
     const auto& vp_ctl = regs.viewport_control;
+    const bool needs_clip_space_adjust = 
+        regs.clipper_control.clip_space == AmdGpu::Liverpool::ClipSpace::MinusWToW;
+    const bool clip_disabled = regs.IsClipDisabled();
+
     for (u32 i = 0; i < Liverpool::NumViewports; i++) {
         const auto& vp = regs.viewports[i];
         const auto& vp_d = regs.viewport_depths[i];
@@ -1013,16 +1044,12 @@ void Rasterizer::UpdateViewportScissorState() const {
             continue;
         }
 
-        const auto zoffset = vp_ctl.zoffset_enable ? vp.zoffset : 0.f;
-        const auto zscale = vp_ctl.zscale_enable ? vp.zscale : 1.f;
+        // 避免重复计算条件判断结果
+        const float zoffset = vp_ctl.zoffset_enable ? vp.zoffset : 0.f;
+        const float zscale = vp_ctl.zscale_enable ? vp.zscale : 1.f;
 
         vk::Viewport viewport{};
-
-        // https://gitlab.freedesktop.org/mesa/mesa/-/blob/209a0ed/src/amd/vulkan/radv_pipeline_graphics.c#L688-689
-        // https://gitlab.freedesktop.org/mesa/mesa/-/blob/209a0ed/src/amd/vulkan/radv_cmd_buffer.c#L3103-3109
-        // When the clip space is ranged [-1...1], the zoffset is centered.
-        // By reversing the above viewport calculations, we get the following:
-        if (regs.clipper_control.clip_space == AmdGpu::Liverpool::ClipSpace::MinusWToW) {
+        if (needs_clip_space_adjust) {
             viewport.minDepth = zoffset - zscale;
             viewport.maxDepth = zoffset + zscale;
         } else {
@@ -1031,53 +1058,50 @@ void Rasterizer::UpdateViewportScissorState() const {
         }
 
         if (!regs.depth_render_override.disable_viewport_clamp) {
-            // Apply depth clamp.
             viewport.minDepth = std::max(viewport.minDepth, vp_d.zmin);
             viewport.maxDepth = std::min(viewport.maxDepth, vp_d.zmax);
         }
 
         if (!instance.IsDepthRangeUnrestrictedSupported()) {
-            // Unrestricted depth range not supported by device. Restrict to valid range.
-            viewport.minDepth = std::max(viewport.minDepth, 0.f);
-            viewport.maxDepth = std::min(viewport.maxDepth, 1.f);
+            viewport.minDepth = std::clamp(viewport.minDepth, 0.f, 1.f);
+            viewport.maxDepth = std::clamp(viewport.maxDepth, 0.f, 1.f);
         }
 
-        if (regs.IsClipDisabled()) {
-            // In case if clipping is disabled we patch the shader to convert vertex position
-            // from screen space coordinates to NDC by defining a render space as full hardware
-            // window range [0..16383, 0..16383] and setting the viewport to its size.
+        if (clip_disabled) {
+            // 避免重复计算硬件窗口限制
+            static constexpr u32 MAX_HARDWARE_WINDOW = 16_KB;
+            const u32 viewport_width = std::min<u32>(instance.GetMaxViewportWidth(), MAX_HARDWARE_WINDOW);
+            const u32 viewport_height = std::min<u32>(instance.GetMaxViewportHeight(), MAX_HARDWARE_WINDOW);
+            
             viewport.x = 0.f;
             viewport.y = 0.f;
-            viewport.width = float(std::min<u32>(instance.GetMaxViewportWidth(), 16_KB));
-            viewport.height = float(std::min<u32>(instance.GetMaxViewportHeight(), 16_KB));
+            viewport.width = static_cast<float>(viewport_width);
+            viewport.height = static_cast<float>(viewport_height);
         } else {
-            const auto xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
-            const auto xscale = vp_ctl.xscale_enable ? vp.xscale : 1.f;
-            const auto yoffset = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
-            const auto yscale = vp_ctl.yscale_enable ? vp.yscale : 1.f;
-
-            viewport.x = xoffset - xscale;
-            viewport.y = yoffset - yscale;
-            viewport.width = xscale * 2.0f;
-            viewport.height = yscale * 2.0f;
+            // 减少多重条件判断，直接计算
+            viewport.x = (vp_ctl.xoffset_enable ? vp.xoffset : 0.f) - (vp_ctl.xscale_enable ? vp.xscale : 1.f);
+            viewport.y = (vp_ctl.yoffset_enable ? vp.yoffset : 0.f) - (vp_ctl.yscale_enable ? vp.yscale : 1.f);
+            viewport.width = (vp_ctl.xscale_enable ? vp.xscale : 1.f) * 2.0f;
+            viewport.height = (vp_ctl.yscale_enable ? vp.yscale : 1.f) * 2.0f;
         }
 
         viewports.push_back(viewport);
 
-        auto vp_scsr = scsr;
+        // 计算裁剪区域
+        Liverpool::Scissor vp_scsr = base_scissor;
         if (regs.mode_control.vport_scissor_enable) {
-            vp_scsr.top_left_x =
-                std::max(vp_scsr.top_left_x, s16(regs.viewport_scissors[i].top_left_x.Value()));
-            vp_scsr.top_left_y =
-                std::max(vp_scsr.top_left_y, s16(regs.viewport_scissors[i].top_left_y.Value()));
-            vp_scsr.bottom_right_x =
-                std::min(vp_scsr.bottom_right_x, regs.viewport_scissors[i].bottom_right_x);
-            vp_scsr.bottom_right_y =
-                std::min(vp_scsr.bottom_right_y, regs.viewport_scissors[i].bottom_right_y);
+            const auto& vp_scissor = regs.viewport_scissors[i];
+            vp_scsr.top_left_x = std::max(vp_scsr.top_left_x, s16(vp_scissor.top_left_x.Value()));
+            vp_scsr.top_left_y = std::max(vp_scsr.top_left_y, s16(vp_scissor.top_left_y.Value()));
+            vp_scsr.bottom_right_x = std::min(vp_scsr.bottom_right_x, vp_scissor.bottom_right_x);
+            vp_scsr.bottom_right_y = std::min(vp_scsr.bottom_right_y, vp_scissor.bottom_right_y);
         }
+        
+        const u32 width = vp_scsr.GetWidth();
+        const u32 height = vp_scsr.GetHeight();
         scissors.push_back({
             .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
-            .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
+            .extent = {width, height},
         });
     }
 

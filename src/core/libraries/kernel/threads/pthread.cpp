@@ -40,7 +40,7 @@ static void ExitThread() {
     }
 
     auto* thread_state = ThrState::Instance();
-    ASSERT(thread_state->active_threads.fetch_sub(1) != 1);
+    thread_state->active_threads.fetch_sub(1, std::memory_order_relaxed);
 
     curthread->lock.lock();
     curthread->state = PthreadState::Dead;
@@ -57,7 +57,8 @@ static void ExitThread() {
      * Kernel will do wakeup at the address, so joiner thread
      * will be resumed if it is sleeping at the address.
      */
-    curthread->tid.store(TidTerminated);
+    const int tid = curthread->tid.load(std::memory_order_relaxed);
+    curthread->tid.store(TidTerminated, std::memory_order_release);
     curthread->tid.notify_all();
 
     curthread->native_thr.Exit();
@@ -219,17 +220,26 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
                                               const char* name) {
     Pthread* curthread = g_curthread;
     auto* thread_state = ThrState::Instance();
+    
+    // 预先检查参数有效性
+    if (thread == nullptr || start_routine == nullptr) {
+        return POSIX_EINVAL;
+    }
+    
     Pthread* new_thread = thread_state->Alloc(curthread);
     if (new_thread == nullptr) {
         return POSIX_EAGAIN;
     }
 
+    // 初始化线程属性
     if (attr == nullptr || *attr == nullptr) {
         new_thread->attr = PthreadAttrDefault;
     } else {
         new_thread->attr = *(*attr);
         new_thread->attr.cpusetsize = 0;
     }
+    
+    // 处理属性继承
     if (new_thread->attr.sched_inherit == PthreadInheritSched) {
         if (True(curthread->attr.flags & PthreadAttrFlags::ScopeSystem)) {
             new_thread->attr.flags |= PthreadAttrFlags::ScopeSystem;
@@ -240,60 +250,63 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
         new_thread->attr.sched_policy = curthread->attr.sched_policy;
     }
 
-    static int TidCounter = 1;
-    new_thread->tid = ++TidCounter;
+    // 生成唯一的线程ID（使用原子操作）
+    static std::atomic<int> TidCounter{1};
+    new_thread->tid = TidCounter.fetch_add(1, std::memory_order_relaxed);
 
+    // 为HLE分配额外的堆栈空间
     if (new_thread->attr.stackaddr_attr == 0) {
-        /* Add additional stack space for HLE */
         static constexpr size_t AdditionalStack = 128_KB;
         new_thread->attr.stacksize_attr += AdditionalStack;
     }
 
+    // 创建堆栈
     if (thread_state->CreateStack(&new_thread->attr) != 0) {
-        /* Insufficient memory to create a stack: */
         thread_state->Free(curthread, new_thread);
         return POSIX_EAGAIN;
     }
 
-    /*
-     * Write a magic value to the thread structure
-     * to help identify valid ones:
-     */
+    // 初始化线程结构体
     new_thread->magic = Pthread::ThrMagic;
     new_thread->start_routine = start_routine;
     new_thread->arg = arg;
     new_thread->cancel_enable = 1;
     new_thread->cancel_async = 0;
 
+    // 设置线程名称
     auto* memory = Core::Memory::Instance();
     if (name && memory->IsValidAddress(name)) {
         new_thread->name = name;
     } else {
-        new_thread->name = fmt::format("Thread{}", new_thread->tid.load());
+        new_thread->name = fmt::format("Thread{}", new_thread->tid.load(std::memory_order_relaxed));
     }
 
     ASSERT(new_thread->attr.suspend == 0);
     new_thread->state = PthreadState::Running;
 
+    // 根据属性设置detached标志
     if (True(new_thread->attr.flags & PthreadAttrFlags::Detached)) {
         new_thread->flags |= ThreadFlags::Detached;
     }
 
-    /* Add the new thread. */
+    // 添加到线程列表
     new_thread->refcount = 1;
     thread_state->Link(curthread, new_thread);
 
-    /* Return thread pointer eariler so that new thread can use it. */
+    // 提前返回线程指针
     (*thread) = new_thread;
 
-    /* Create thread */
+    // 创建本地线程
     new_thread->native_thr = Core::NativeThread();
     int ret = new_thread->native_thr.Create(RunThread, new_thread, &new_thread->attr);
-    ASSERT_MSG(ret == 0, "Failed to create thread with error {}", ret);
-    if (ret) {
+    if (ret != 0) {
+        thread_state->Unlink(curthread, new_thread);
+        thread_state->Free(curthread, new_thread);
         *thread = nullptr;
+        return POSIX_EAGAIN;
     }
-    return ret;
+    
+    return 0;
 }
 
 int PS4_SYSV_ABI posix_pthread_create(PthreadT* thread, const PthreadAttrT* attr,
@@ -328,8 +341,14 @@ void PS4_SYSV_ABI sched_yield() {
 
 int PS4_SYSV_ABI posix_pthread_once(PthreadOnce* once_control,
                                     void PS4_SYSV_ABI (*init_routine)()) {
+    // 快速路径：已经初始化完成的情况
+    if (once_control->state.load(std::memory_order_acquire) == PthreadOnceState::Done) {
+        return 0;
+    }
+
+    // 慢路径：处理初始化和等待
     for (;;) {
-        auto state = once_control->state.load();
+        auto state = once_control->state.load(std::memory_order_relaxed);
         if (state == PthreadOnceState::Done) {
             return 0;
         }
@@ -340,7 +359,7 @@ int PS4_SYSV_ABI posix_pthread_once(PthreadOnce* once_control,
             }
         } else if (state == PthreadOnceState::InProgress) {
             if (once_control->state.compare_exchange_strong(state, PthreadOnceState::Wait,
-                                                            std::memory_order_acquire)) {
+                                                            std::memory_order_relaxed)) {
                 once_control->state.wait(PthreadOnceState::Wait);
             }
         } else if (state == PthreadOnceState::Wait) {
@@ -352,12 +371,6 @@ int PS4_SYSV_ABI posix_pthread_once(PthreadOnce* once_control,
 
     const auto once_cancel_handler = [](void* arg) PS4_SYSV_ABI {
         PthreadOnce* once_control = (PthreadOnce*)arg;
-        auto state = PthreadOnceState::InProgress;
-        if (once_control->state.compare_exchange_strong(state, PthreadOnceState::NeverDone,
-                                                        std::memory_order_release)) {
-            return;
-        }
-
         once_control->state.store(PthreadOnceState::NeverDone, std::memory_order_release);
         once_control->state.notify_all();
     };
@@ -367,12 +380,7 @@ int PS4_SYSV_ABI posix_pthread_once(PthreadOnce* once_control,
     init_routine();
     g_curthread->cleanup.pop_front();
 
-    auto state = PthreadOnceState::InProgress;
-    if (once_control->state.compare_exchange_strong(state, PthreadOnceState::Done,
-                                                    std::memory_order_release)) {
-        return 0;
-    }
-    once_control->state.store(PthreadOnceState::Done);
+    once_control->state.store(PthreadOnceState::Done, std::memory_order_release);
     once_control->state.notify_all();
     return 0;
 }

@@ -6,6 +6,7 @@
 #include <map>
 #include <mutex>
 #include <string_view>
+#include "common/assert.h"
 #include "common/enum.h"
 #include "common/singleton.h"
 #include "common/types.h"
@@ -219,7 +220,20 @@ public:
 
 private:
     VMAHandle FindVMA(VAddr target) {
-        return std::prev(vma_map.upper_bound(target));
+        // 使用lower_bound来代替upper_bound+prev，减少一次迭代器操作
+        auto iter = vma_map.lower_bound(target);
+        if (iter == vma_map.end()) {
+            // 如果没找到，则在上界之前的就是包含该地址的区域
+            return std::prev(iter);
+        } else if (iter->first > target) {
+            // 如果找到的迭代器键值大于目标地址，则前一个区域包含该地址
+            if (iter == vma_map.begin()) {
+                ASSERT_MSG(false, "Could not find VMA containing address {:#018X}", target);
+            }
+            return std::prev(iter);
+        }
+        // 找到的就是匹配的区域
+        return iter;
     }
 
     DMemHandle FindDmemArea(PAddr target) {

@@ -51,22 +51,28 @@ void ThreadState::Collect(Pthread* curthread) {
 }
 
 void ThreadState::TryCollect(Pthread* thread) {
-    SCOPE_EXIT {
-        thread->lock.unlock();
-    };
+    // 首先做快速检查，如果不满足条件直接返回
     if (!thread->ShouldCollect()) {
+        thread->lock.unlock();
         return;
     }
 
+    // 增加引用计数以防止在我们检查时被收集
     thread->refcount++;
     thread->lock.unlock();
-    std::scoped_lock lk{thread_list_lock};
-    thread->lock.lock();
+    
+    // 获取线程列表锁后再次检查
+    std::unique_lock lk{thread_list_lock};
+    if (!thread->lock.try_lock()) {
+        thread->lock.lock();
+    }
+    
     thread->refcount--;
     if (thread->ShouldCollect()) {
         threads.erase(thread);
         gc_list.push_back(thread);
     }
+    thread->lock.unlock();
 }
 
 Pthread* ThreadState::Alloc(Pthread* curthread) {
@@ -140,7 +146,12 @@ int ThreadState::FindThread(Pthread* thread, bool include_dead) {
     if (it == threads.end()) {
         return POSIX_ESRCH;
     }
-    thread->lock.lock();
+    
+    // 使用尝试锁而不是阻塞锁，减少线程争用
+    if (!thread->lock.try_lock()) {
+        thread->lock.lock();
+    }
+    
     if (!include_dead && thread->state == PthreadState::Dead) {
         thread->lock.unlock();
         return POSIX_ESRCH;

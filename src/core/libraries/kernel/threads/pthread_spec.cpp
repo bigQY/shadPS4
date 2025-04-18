@@ -43,57 +43,64 @@ int PS4_SYSV_ABI posix_pthread_key_delete(PthreadKeyT key) {
 
 void _thread_cleanupspecific() {
     Pthread* curthread = g_curthread;
-    PthreadKeyDestructor destructor;
-    const void* data = NULL;
-
+    
+    // 如果没有特定数据，直接返回
     if (curthread->specific == nullptr) {
         return;
     }
+    
+    PthreadKeyDestructor destructor = nullptr;
+    const void* data = nullptr;
 
     std::unique_lock lk{KeytableLock};
-    for (int i = 0; (i < PthreadDestructorIterations) && (curthread->specific_data_count > 0);
-         i++) {
+    
+    // 预先检查是否有数据需要清理
+    if (curthread->specific_data_count <= 0) {
+        delete[] curthread->specific;
+        curthread->specific = nullptr;
+        return;
+    }
+    
+    // 使用固定次数的迭代来确保析构函数能够正确执行
+    for (int i = 0; (i < PthreadDestructorIterations) && (curthread->specific_data_count > 0); i++) {
         for (int key = 0; (key < PthreadKeysMax) && (curthread->specific_data_count > 0); key++) {
             destructor = nullptr;
+            data = nullptr;
 
+            // 验证键的有效性和数据存在性
             if (ThreadKeytable[key].allocated && (curthread->specific[key].data != nullptr)) {
                 if (curthread->specific[key].seqno == ThreadKeytable[key].seqno) {
+                    // 缓存数据和析构函数，以便在不持有锁的情况下调用析构函数
                     data = curthread->specific[key].data;
                     destructor = ThreadKeytable[key].destructor;
                 }
+                
+                // 清除数据引用
                 curthread->specific[key].data = nullptr;
                 curthread->specific_data_count--;
-            } else if (curthread->specific[key].data != NULL) {
-                /*
-                 * This can happen if the key is deleted via
-                 * pthread_key_delete without first setting the value
-                 * to NULL in all threads.  POSIX says that the
-                 * destructor is not invoked in this case.
-                 */
+            } else if (curthread->specific[key].data != nullptr) {
+                // 处理键已删除但值仍存在的情况
                 curthread->specific[key].data = nullptr;
                 curthread->specific_data_count--;
             }
 
-            /*
-             * If there is a destructor, call it
-             * with the key table entry unlocked:
-             */
-            if (destructor != nullptr) {
-                /*
-                 * Don't hold the lock while calling the
-                 * destructor:
-                 */
+            // 如果有析构函数，则在不持有锁的情况下调用它
+            if (destructor != nullptr && data != nullptr) {
                 lk.unlock();
-                Core::ExecuteGuest(destructor, data);
+                Core::ExecuteGuest(destructor, const_cast<void*>(data));
                 lk.lock();
             }
         }
     }
-    delete[] curthread->specific;
-    curthread->specific = nullptr;
+    
+    // 如果仍有剩余数据，记录警告
     if (curthread->specific_data_count > 0) {
         LOG_WARNING(Lib_Kernel, "Thread has exited with leftover thread-specific data");
     }
+    
+    // 最后清理内存
+    delete[] curthread->specific;
+    curthread->specific = nullptr;
 }
 
 int PS4_SYSV_ABI posix_pthread_setspecific(PthreadKeyT key, const void* value) {

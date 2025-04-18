@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <mutex>
 #include <vector>
+#include <unordered_map>
 #include "core/libraries/kernel/threads.h"
 #include "core/module.h"
 
@@ -90,10 +91,10 @@ public:
     }
 
     u32 FindByName(const std::filesystem::path& name) const {
-        for (u32 i = 0; i < m_modules.size(); i++) {
-            if (name == m_modules[i]->file) {
-                return i;
-            }
+        // 检查快速查找表中是否有该模块
+        auto it = m_module_name_map.find(name.string());
+        if (it != m_module_name_map.end()) {
+            return it->second;
         }
         return -1;
     }
@@ -166,6 +167,11 @@ private:
     u32 num_static_modules{};
     AppHeapAPI heap_api{};
     std::vector<std::unique_ptr<Module>> m_modules;
+    std::unordered_map<std::string, u32> m_module_name_map;
+    // 添加符号解析结果缓存
+    mutable std::unordered_map<std::string, Loader::SymbolRecord> m_symbol_cache;
+    // 添加地址范围索引，用于快速查找包含特定地址的模块
+    std::vector<std::pair<VAddr, VAddr>> m_address_ranges;
     Loader::SymbolsResolver m_hle_symbols{};
 };
 

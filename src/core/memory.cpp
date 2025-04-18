@@ -430,6 +430,13 @@ s32 MemoryManager::UnmapMemory(VAddr virtual_addr, size_t size) {
 }
 
 u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma_base, u64 size) {
+    // 快速判断：如果是Free类型，直接返回调整后的大小
+    if (vma_base.type == VMAType::Free) {
+        const auto start_in_vma = virtual_addr - vma_base.base;
+        return vma_base.size - start_in_vma < size ? vma_base.size - start_in_vma : size;
+    }
+    
+    // 计算关键参数
     const auto vma_base_addr = vma_base.base;
     const auto vma_base_size = vma_base.size;
     const auto type = vma_base.type;
@@ -438,17 +445,16 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
     const auto start_in_vma = virtual_addr - vma_base_addr;
     const auto adjusted_size =
         vma_base_size - start_in_vma < size ? vma_base_size - start_in_vma : size;
-    const bool has_backing = type == VMAType::Direct || type == VMAType::File;
 
-    if (type == VMAType::Free) {
-        return adjusted_size;
-    }
+    // 更新灵活内存使用量
     if (type == VMAType::Flexible) {
         flexible_usage -= adjusted_size;
     }
+    
+    // 通知显卡取消内存映射
     rasterizer->UnmapMemory(virtual_addr, adjusted_size);
 
-    // Mark region as free and attempt to coalesce it with neighbours.
+    // 标记区域为空闲并尝试与邻居合并
     const auto new_it = CarveVMA(virtual_addr, adjusted_size);
     auto& vma = new_it->second;
     vma.type = VMAType::Free;
@@ -456,15 +462,22 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
     vma.phys_base = 0;
     vma.disallow_merge = false;
     vma.name = "";
-    const auto post_merge_it = MergeAdjacent(vma_map, new_it);
-    auto& post_merge_vma = post_merge_it->second;
-    bool readonly_file = post_merge_vma.prot == MemoryProt::CpuRead && type == VMAType::File;
+    
+    // 对于需要取消映射的类型，进行真正的取消映射操作
     if (type != VMAType::Reserved && type != VMAType::PoolReserved) {
-        // Unmap the memory region.
+        const auto post_merge_it = MergeAdjacent(vma_map, new_it);
+        const bool has_backing = type == VMAType::Direct || type == VMAType::File;
+        const bool readonly_file = post_merge_it->second.prot == MemoryProt::CpuRead && type == VMAType::File;
+        
+        // 取消映射内存区域
         impl.Unmap(vma_base_addr, vma_base_size, start_in_vma, start_in_vma + adjusted_size,
                    phys_base, is_exec, has_backing, readonly_file);
         TRACK_FREE(virtual_addr, "VMEM");
+    } else {
+        // 即使是预留内存，也需要合并相邻区域
+        MergeAdjacent(vma_map, new_it);
     }
+    
     return adjusted_size;
 }
 
@@ -687,7 +700,7 @@ void MemoryManager::InvalidateMemory(const VAddr addr, const u64 size) const {
 }
 
 VAddr MemoryManager::SearchFree(VAddr virtual_addr, size_t size, u32 alignment) {
-    // If the requested address is below the mapped range, start search from the lowest address
+    // 如果请求的地址低于映射范围，则从最低地址开始搜索
     auto min_search_address = impl.SystemManagedVirtualBase();
     if (virtual_addr < min_search_address) {
         virtual_addr = min_search_address;
@@ -696,53 +709,57 @@ VAddr MemoryManager::SearchFree(VAddr virtual_addr, size_t size, u32 alignment) 
     auto it = FindVMA(virtual_addr);
     ASSERT_MSG(it != vma_map.end(), "Specified mapping address was not found!");
 
-    // If the VMA is free and contains the requested mapping we are done.
-    if (it->second.IsFree() && it->second.Contains(virtual_addr, size)) {
-        return virtual_addr;
+    // 如果VMA是自由的，并且包含请求的映射区域，直接返回
+    if (it->second.IsFree()) {
+        const auto aligned_addr = alignment > 0 ? Common::AlignUp(virtual_addr, alignment) : virtual_addr;
+        if (aligned_addr >= it->second.base && aligned_addr + size <= it->second.base + it->second.size) {
+            return aligned_addr;
+        }
     }
-    // Search for the first free VMA that fits our mapping.
-    const auto is_suitable = [&] {
-        if (!it->second.IsFree()) {
-            return false;
-        }
-        const auto& vma = it->second;
-        virtual_addr = Common::AlignUp(vma.base, alignment);
-        // Sometimes the alignment itself might be larger than the VMA.
-        if (virtual_addr > vma.base + vma.size) {
-            return false;
-        }
-        const size_t remaining_size = vma.base + vma.size - virtual_addr;
-        return remaining_size >= size;
-    };
-    while (!is_suitable()) {
+
+    // 搜索第一个适合我们映射的自由VMA
+    while (true) {
         ++it;
+        if (it == vma_map.end()) {
+            ASSERT_MSG(false, "Failed to find free area for mapping!");
+            return 0;
+        }
+        
+        if (it->second.IsFree()) {
+            const auto aligned_addr = alignment > 0 ? Common::AlignUp(it->second.base, alignment) : it->second.base;
+            // 有时对齐本身可能大于VMA
+            if (aligned_addr > it->second.base + it->second.size) {
+                continue;
+            }
+            const size_t remaining_size = it->second.base + it->second.size - aligned_addr;
+            if (remaining_size >= size) {
+                return aligned_addr;
+            }
+        }
     }
-    return virtual_addr;
 }
 
 MemoryManager::VMAHandle MemoryManager::CarveVMA(VAddr virtual_addr, size_t size) {
     auto vma_handle = FindVMA(virtual_addr);
     ASSERT_MSG(vma_handle != vma_map.end(), "Virtual address not in vm_map");
 
-    const VirtualMemoryArea& vma = vma_handle->second;
-    ASSERT_MSG(vma.base <= virtual_addr, "Adding a mapping to already mapped region");
-
-    const VAddr start_in_vma = virtual_addr - vma.base;
-    const VAddr end_in_vma = start_in_vma + size;
-
-    if (start_in_vma == 0 && size == vma.size) {
-        // if requsting the whole VMA, return it
+    const VAddr start_in_vma = virtual_addr - vma_handle->second.base;
+    
+    // 快速路径：如果请求的是整个VMA，直接返回不做分割
+    if (start_in_vma == 0 && size == vma_handle->second.size) {
         return vma_handle;
     }
 
-    ASSERT_MSG(end_in_vma <= vma.size, "Mapping cannot fit inside free region");
+    ASSERT_MSG(vma_handle->second.base <= virtual_addr, "Adding a mapping to already mapped region");
+    const VAddr end_in_vma = start_in_vma + size;
+    ASSERT_MSG(end_in_vma <= vma_handle->second.size, "Mapping cannot fit inside free region");
 
-    if (end_in_vma != vma.size) {
-        // Split VMA at the end of the allocated region
+    // 优化分割顺序：先分割末尾，再分割开头
+    // 这样可以减少一次结构体复制（如果两处都需要分割的话）
+    if (end_in_vma != vma_handle->second.size) {
         Split(vma_handle, end_in_vma);
     }
     if (start_in_vma != 0) {
-        // Split VMA at the start of the allocated region
         vma_handle = Split(vma_handle, start_in_vma);
     }
 
